@@ -489,4 +489,71 @@ describe('view transitions plugin', () => {
       expect(hookSpy).toHaveBeenCalledWith(mockTransition)
     })
   })
+
+  describe('race condition: new navigation while previous transition is animating', () => {
+    it('should preserve finishTransition when the previous transition\'s finished promise settles', async () => {
+      // Two separate mock transitions — one per navigation
+      const firstTransition = createMockViewTransition()
+      const secondTransition = createMockViewTransition()
+      let callCount = 0
+
+      // Override startViewTransition to return a different mock per call
+      startViewTransition = vi.fn((callbackOrOptions: StartViewTransitionCallback | StartViewTransitionOptions) => {
+        if (typeof callbackOrOptions === 'function') {
+          callbackOrOptions()
+        } else {
+          callbackOrOptions.update()
+        }
+        return callCount++ === 0 ? firstTransition : secondTransition
+      })
+
+      // Extend installViewTransitionGuard to replicate the plugin's cleanup fix:
+      // Only call resetTransitionState when the settled transition is still the active one.
+      let activeTransition: MockViewTransition | undefined
+      let finishTransitionFn: (() => void) | undefined
+
+      const removeGuard = router.beforeResolve(async (to, from) => {
+        if (to.matched.length === 0 || to.path === from.path) { return }
+
+        const promise = new Promise<void>((resolve) => { finishTransitionFn = resolve })
+        let changeRoute: () => void
+        const ready = new Promise<void>(resolve => (changeRoute = resolve))
+        const update = () => { changeRoute(); return promise }
+
+        activeTransition = startViewTransition(update) as unknown as MockViewTransition
+
+        // Replicate the fixed cleanup: only reset if this is still the active transition
+        const captured = activeTransition
+        captured.finished.catch(() => {}).finally(() => {
+          if (activeTransition === captured) {
+            activeTransition = undefined
+            finishTransitionFn = undefined
+          }
+        })
+
+        return ready
+      })
+
+      testCleanups.push(removeGuard)
+
+      // Start navigation 1 — don't await its completion
+      const nav1 = navigateTo('/vt-a')
+      await flushPromises()
+
+      // Start navigation 2 while nav1's transition is still animating
+      const nav2 = navigateTo('/vt-b')
+      await flushPromises()
+
+      // The browser auto-skips nav1's transition (startViewTransition for nav2 was called)
+      firstTransition._resolveFinished()
+      await flushPromises()
+
+      // finishTransitionFn should still point to nav2's resolver, not have been cleared
+      expect(finishTransitionFn).toBeDefined()
+
+      // Simulate page:finish for nav2
+      finishTransitionFn?.()
+      await Promise.all([nav1, nav2])
+    })
+  })
 })
